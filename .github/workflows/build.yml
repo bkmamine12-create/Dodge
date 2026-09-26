@@ -1,66 +1,285 @@
-name: Build Dodge APK
+package com.dodge.game
 
-on:
-  push:
-    branches: [ main, master ]
-  workflow_dispatch: {}
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
+import android.os.Handler
+import android.os.Looper
+import android.util.AttributeSet
+import android.view.MotionEvent
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.random.Random
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+class GameView @JvmOverloads constructor(
+    context: Context,
+    attrs: AttributeSet? = null
+) : SurfaceView(context, attrs), SurfaceHolder.Callback, Runnable {
 
-      - name: Unzip project source
-        run: |
-          ZIP_FILE=$(ls *.zip | head -n 1)
-          unzip -o "$ZIP_FILE"
+    interface Listener {
+        fun onScoreChanged(score: Int)
+        fun onGameOver(finalScore: Int)
+    }
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+    var listener: Listener? = null
 
-      - name: Set up Android SDK (manual, more reliable)
-        run: |
-          export ANDROID_SDK_ROOT="$HOME/android-sdk"
-          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-          cd "$ANDROID_SDK_ROOT/cmdline-tools"
-          curl -sSL -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          unzip -q cmdline-tools.zip
-          mv cmdline-tools latest
-          rm cmdline-tools.zip
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+    fun attachSound(soundManager: SoundManager) {
+        sound = soundManager
+    }
 
-      - name: Accept licenses and install SDK packages
-        run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+    private var gameThread: Thread? = null
+    @Volatile private var running = false
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.7
+    private val surfaceReadyLock = Object()
+    private var surfaceReady = false
 
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var sound: SoundManager? = null
 
-      - name: Build release APK
-        run: gradle assembleRelease --no-daemon
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        density = resources.displayMetrics.density
+        synchronized(surfaceReadyLock) { surfaceReady = true }
+        if (gameThread?.isAlive != true) {
+            running = true
+            gameThread = Thread(this, "DodgeGameThread").also { it.start() }
+        }
+    }
 
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Dodge-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        screenW = width.toFloat()
+        screenH = height.toFloat()
+        val p = player
+        if (p == null) {
+            player = Player(screenW / 2f, screenH - dp(90f), dp(PLAYER_SIZE_DP))
+        } else {
+            p.y = screenH - dp(90f)
+        }
+    }
 
-      - name: Upload release APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Dodge-release-apk
-          path: app/build/outputs/apk/release/app-release.apk
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        synchronized(surfaceReadyLock) { surfaceReady = false }
+        running = false
+        try {
+            gameThread?.join(500)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        gameThread = null
+    }
+
+    init {
+        holder.addCallback(this)
+        isFocusable = true
+    }
+
+    fun startGame() {
+        pendingStart = true
+    }
+
+    fun endIfPlaying() {
+        if (playing) {
+            playing = false
+            listener?.onGameOver(score)
+        }
+    }
+
+    fun release() {
+        sound?.release()
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!playing) return true
+        if (event.action == MotionEvent.ACTION_DOWN || event.action == MotionEvent.ACTION_MOVE) {
+            player?.let {
+                val half = it.size / 2f
+                it.targetX = event.x.coerceIn(half, screenW - half)
+            }
+        }
+        return true
+    }
+
+    private var screenW = 0f
+    private var screenH = 0f
+    private var density = 1f
+    private var player: Player? = null
+
+    private val activeEnemies = ArrayList<Enemy>()
+    private val enemyPool = ArrayList<Enemy>()
+
+    @Volatile private var playing = false
+    @Volatile private var score = 0
+    private var elapsedSeconds = 0f
+    private var spawnTimer = 0f
+    private var lastFrameNanos = 0L
+    @Volatile private var pendingStart = false
+
+    private val baseSpeedDp = 220f
+    private val speedGrowthPerSec = 6.5f
+    private val maxSpeedDp = 900f
+    private val baseSpawnInterval = 1.05f
+    private val minSpawnInterval = 0.32f
+    private val spawnDecayPerSec = 0.012f
+    private val enemyRadiusDp = 16f
+
+    companion object {
+        private const val PLAYER_SIZE_DP = 42f
+        private const val TARGET_FPS = 60
+        private const val FRAME_BUDGET_NANOS = 1_000_000_000L / TARGET_FPS
+    }
+
+    override fun run() {
+        while (running) {
+            val ready = synchronized(surfaceReadyLock) { surfaceReady }
+            if (!ready) {
+                sleepQuiet(16)
+                continue
+            }
+
+            val frameStart = System.nanoTime()
+
+            if (pendingStart) {
+                pendingStart = false
+                resetRun()
+                playing = true
+                lastFrameNanos = frameStart
+            }
+
+            var dt = (frameStart - lastFrameNanos) / 1_000_000_000f
+            lastFrameNanos = frameStart
+            dt = dt.coerceIn(0f, 0.05f)
+
+            if (playing) update(dt)
+
+            val canvas = try {
+                holder.lockCanvas()
+            } catch (e: Exception) {
+                null
+            }
+            if (canvas != null) {
+                try {
+                    renderFrame(canvas)
+                } finally {
+                    try {
+                        holder.unlockCanvasAndPost(canvas)
+                    } catch (e: Exception) {
+                    }
+                }
+            }
+
+            val frameNanos = System.nanoTime() - frameStart
+            val sleepMillis = (FRAME_BUDGET_NANOS - frameNanos) / 1_000_000
+            if (sleepMillis > 0) sleepQuiet(sleepMillis)
+        }
+    }
+
+    private fun sleepQuiet(millis: Long) {
+        try {
+            Thread.sleep(millis)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    private fun resetRun() {
+        activeEnemies.forEach { recycle(it) }
+        activeEnemies.clear()
+        score = 0
+        elapsedSeconds = 0f
+        spawnTimer = 0f
+        player?.let {
+            it.x = screenW / 2f
+            it.targetX = it.x
+        }
+        mainHandler.post { listener?.onScoreChanged(0) }
+    }
+
+    private fun update(dt: Float) {
+        val p = player ?: return
+        elapsedSeconds += dt
+
+        p.x += (p.targetX - p.x) * min(1f, dt * 14f)
+
+        spawnTimer += dt
+        val spawnInterval = max(minSpawnInterval, baseSpawnInterval - spawnDecayPerSec * elapsedSeconds)
+        if (spawnTimer >= spawnInterval) {
+            spawnTimer = 0f
+            spawnEnemy()
+        }
+
+        val currentSpeed = min(maxSpeedDp, baseSpeedDp + speedGrowthPerSec * elapsedSeconds) * density
+        val iterator = activeEnemies.iterator()
+        while (iterator.hasNext()) {
+            val e = iterator.next()
+            e.y += currentSpeed * dt
+
+            if (circleIntersectsSquare(e, p)) {
+                playing = false
+                sound?.playHit()
+                val finalScore = score
+                mainHandler.post { listener?.onGameOver(finalScore) }
+                return
+            }
+
+            if (e.y - e.radius > screenH) {
+                iterator.remove()
+                recycle(e)
+                score += 1
+                sound?.playScore()
+                val newScore = score
+                mainHandler.post { listener?.onScoreChanged(newScore) }
+            }
+        }
+    }
+
+    private fun spawnEnemy() {
+        val radius = dp(enemyRadiusDp)
+        if (screenW <= radius * 2f) return
+        val x = Random.nextFloat() * (screenW - radius * 2f) + radius
+        val speed = min(maxSpeedDp, baseSpeedDp + speedGrowthPerSec * elapsedSeconds) * density
+        val enemy = if (enemyPool.isNotEmpty()) {
+            enemyPool.removeAt(enemyPool.size - 1).also { it.reset(x, -radius, radius, speed) }
+        } else {
+            Enemy(x, -radius, radius, speed)
+        }
+        activeEnemies.add(enemy)
+        sound?.playSpawn()
+    }
+
+    private fun recycle(enemy: Enemy) {
+        if (enemyPool.size < 40) enemyPool.add(enemy)
+    }
+
+    private fun circleIntersectsSquare(e: Enemy, p: Player): Boolean {
+        val closestX = e.x.coerceIn(p.left(), p.right())
+        val closestY = e.y.coerceIn(p.top(), p.bottom())
+        val dx = e.x - closestX
+        val dy = e.y - closestY
+        return (dx * dx + dy * dy) < (e.radius * e.radius)
+    }
+
+    private val backgroundColor = Color.parseColor("#0A0A0C")
+    private val playerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#F5F5F7") }
+    private val enemyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#FF3B3B") }
+    private val playerRect = RectF()
+
+    private fun renderFrame(canvas: Canvas) {
+        canvas.drawColor(backgroundColor)
+
+        val p = player
+        if (p != null) {
+            playerRect.set(p.left(), p.top(), p.right(), p.bottom())
+            val corner = dp(8f)
+            canvas.drawRoundRect(playerRect, corner, corner, playerPaint)
+        }
+
+        for (e in activeEnemies) {
+            canvas.drawCircle(e.x, e.y, e.radius, enemyPaint)
+        }
+    }
+
+    private fun dp(value: Float): Float = value * density
+}
